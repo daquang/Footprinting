@@ -4,6 +4,9 @@ from numpy import *
 from Emissions import *
 from random import *
 import itertools
+import functools
+from multiprocessing import *
+from datetime import datetime
 
 def hmm_generate(n,a,e):
 	seq = zeros(n)
@@ -125,6 +128,122 @@ def hmm_train2(seqs, a_guess, e_guess):#start here and train_step 1/10/12
 	print e_updated
 	return a_updated, e_updated
 
+"""
+The mapping function used in train_step_parallel. Each of the outputs are meant to be summed with the respective
+outputs from other mapped objects.
+Input:
+seq - a training sequence
+a_guess - guess for the transition state matrix
+e_guess - guess for the Emissions parameters
+Output:
+post - the posterior decoded probabilities matrix
+logPi - this sequence's contribution to the overall logP score
+e_denominatori - this sequence's contribution to the overall denominator (for calculating ML mean and variance)
+mean_numeratori - this sequence's contribution to the overall numerator of the mean (for calculating ML mean)
+Ai - this sequence's contribution to the transition state matrix
+"""
+def train_parallel_map(seq, a2, e2p):
+	a_guess = a2
+	e_guess = Emission(e2p)
+	(s, f_tilde, b_tilde, pdf_matrix) = posterior_step(seq, a_guess, e_guess)
+	post = s*f_tilde*b_tilde
+	es = pdf_matrix[:,1:].transpose()
+	L = seq.size
+	logPi = log(s).sum()
+	#Ai = a_guess*dot(f_tilde[:,0:L-1],es*b_tilde[:,1:].transpose())
+	#cannot return Ai because dot product is already parallelized
+	e_denominatori = post.sum(axis=1)
+	mean_numeratori = (seq*post).sum(axis=1)
+	#the last three are necessary for a single process calculation of Ai
+	return post, mean_numeratori, e_denominatori, logPi, f_tilde, b_tilde, es
+
+"""
+"""
+def variance_parallel_map(x, m):
+	return (((x[0] - m[:,newaxis])**2)*x[1][0]).sum(axis=1)
+	
+
+"""
+A parallelized version of the train_step function
+Input:
+seqs - the training sequences
+a_guess - guess for the transition state matrix
+e_guess - guess for the Emissions parameters
+pool - the multiprocessing pooler
+"""#start here 2/8/13
+def train_step_parallel(seqs,a_guess,e_guess,pool):#one step of iteration, 
+#returns log likelihood and updated guesses. accepts sequences and guesses. e_guess is an Emission class
+	logP = 0
+	A = zeros(a_guess.shape)
+	mean_numerator = zeros(a_guess.shape[0])#each row holds the numerator for the mean for each state
+	var_numerator = zeros(a_guess.shape[0])#each row holds the numerator for the variance for each state
+	e_denominator = zeros(a_guess.shape[0])#each element is the denominator for each state
+	"""
+	posts = list()
+	for seq in seqs:
+		(s, f_tilde, b_tilde, pdf_matrix) = posterior_step(seq, a_guess, e_guess)
+		post = s*f_tilde*b_tilde
+		posts.append(post)
+		es = pdf_matrix[:,1:].transpose()
+		L = seq.size
+		logP = logP + log(s).sum()
+		A = A + a_guess*dot(f_tilde[:,0:L-1],es*b_tilde[:,1:].transpose())
+		e_denominator = e_denominator + post.sum(axis=1)
+		mean_numi = (seq*post).sum(axis=1)
+		mean_numerator = mean_numerator + mean_numi
+	"""
+	infos = pool.map(functools.partial(train_parallel_map,a2=a_guess,e2p=e_guess.p),seqs)
+	#this step is for finding all As
+	z = [(a_guess*dot(info[4][:,:-1],info[6]*info[5][:,1:].transpose()),info[1],info[2],info[3]) for info in infos]
+	(A,mean_numerator,e_denominator,logP) = sum(z,axis=0)
+	"""
+	for info in infos:#whoops
+		A += info[1]
+		mean_numerator += info[2]
+		e_denominator += info[3]
+		logP += info[4]
+	"""
+	mu = mean_numerator/e_denominator
+	variances = pool.map(functools.partial(variance_parallel_map,m=mu), itertools.izip(seqs,infos))
+	"""
+	for seq,post in itertools.izip(seqs,posts):#this loop establishes the variance, since mu needed to be calculated first
+		var_numerator = var_numerator + (((seq - mu[:,newaxis])**2)*post).sum(axis=1)#wrong post lol.forgot to multiply by post here
+	"""
+	for var_numeratori in variances:#this loop establishes the variance, since mu needed to be calculated first
+		var_numerator += var_numeratori
+	sigmasq = var_numerator/e_denominator
+	a_updated = dot(diag(1/A.sum(axis=1)),A)
+	e_updated = e_guess.updated_emission(mu,sigmasq)
+	return logP, a_updated, e_updated
+
+"""
+A parallelized version of the version 1 of hmm_train (that is, no fixing).
+Input:
+seqs - the training sequences
+a_guess - guess for the transition state matrix
+e_guess - guess for the Emissions parameters
+pool - the multiprocessing pooler
+"""
+def hmm_train_parallel(seqs, a_guess, e_guess, pool):#start here and train_step 1/10/12
+	global a_guess_global
+	global e_guess_global
+	a_guess_global = a_guess
+	e_guess_global = e_guess
+	tol = 1e-6
+	maxiter = 500
+	(new_logP, a_updated, e_updated) = train_step_parallel(seqs, a_guess, e_guess,pool)
+	for k in xrange(maxiter):
+		print "step " + str(k) + "\n"
+		print a_updated
+		print e_updated.p
+		old_logP = new_logP
+		(new_logP, a_updated, e_updated) = train_step_parallel(seqs, a_updated, e_updated,pool)
+		if abs((old_logP - new_logP)/old_logP) < tol:#second conditional break
+			break
+	print 'Converged in ' + str(k) + ' steps'
+	print a_updated
+	print e_updated
+	return a_updated, e_updated
 
 def train_step(seqs,a_guess,e_guess):#one step of iteration, 
 #returns log likelihood and updated guesses. accepts sequences and guesses. e_guess is an Emission class
@@ -150,7 +269,7 @@ def train_step(seqs,a_guess,e_guess):#one step of iteration,
 		var_numerator = var_numerator + (((seq - mu[:,newaxis])**2)*post).sum(axis=1)#wrong post lol.forgot to multiply by post here
 	sigmasq = var_numerator/e_denominator
 	a_updated = dot(diag(1/A.sum(axis=1)),A)
-        e_updated = e_guess.updated_emission(mu,sigmasq)
+	e_updated = e_guess.updated_emission(mu,sigmasq)
 	return logP, a_updated, e_updated
 
 def posterior_step(seq, a, e):#accepts a sequence, the current guesses, 
@@ -195,7 +314,7 @@ def train_test():
 	seqs = list()
 	seqs.append(seq)
 	(seq,states) = hmm_generate(1000,a,e)
-        seq = array(seq,dtype=int)
+	seq = array(seq,dtype=int)
 	seqs.append(seq)
 	hmm_train(seqs,a,e)
 
@@ -344,17 +463,25 @@ def outputFootprintingResults(filename, genome, seqs, regions, a, e, offset=0):
 	output_handle.close()
 	
 
-def f(x):
-    a2 = array([[0.9999,0.0001,0,0,0],[0,0.9,0.1,0,0],[0.0150,0.0450,0.9000,0.035,0.005],[0,0.03,0,0.97,0],[0,0,0,0,1]])
-    e2 = Emission([[0,0.05],[0.5,1],[-0.5,1],[0,0.05],[0,0.05]])
-    return posterior_step(x, a2, e2)
+def f(x,a,ep):
+	#a2 = array([[0.9999,0.0001,0,0,0],[0,0.9,0.1,0,0],[0.0150,0.0450,0.9000,0.035,0.005],[0,0.03,0,0.97,0],[0,0,0,0,1]])
+	#e2 = Emission([[0,0.05],[0.5,1],[-0.5,1],[0,0.05],[0,0.05]])
+	a2 = a
+	e2 = Emission(ep)
+	(s, f_tilde, b_tilde, pdf_matrix) = posterior_step(x, a2, e2)
+	post = s*f_tilde*b_tilde
+	es = pdf_matrix[:,1:].transpose()
+	L = x.size
+	logPi = log(s).sum()
+	#Ai = a2*dot(f_tilde[:,0:L-1],es*b_tilde[:,1:].transpose())
+	e_denominatori = post.sum(axis=1)
+	mean_numeratori = (x*post).sum(axis=1)
+	return (post, logPi, mean_numeratori, e_denominatori)
 
 def parjobs():
-	from multiprocessing import Pool
-	from datetime import datetime
-	pool = Pool(processes=6)
+	pool = Pool(processes=64)
 	seqs = load('Chr6seqs.npy')
-	seqs2 = [v for v in seqs[0:10000]]#only need first one thousand
+	seqs2 = [v for v in seqs[0:1000]]#only need first one thousand
 	win = [-1/2.0,0,1/2.0]
 	seqs3 = [v/mean(v[v>4]) for v in seqs2]#normalize the sequences by dividing by average of all above-threshold values
 	seqs4 = [savitzky_golay(v,9,2,1,1) for v in seqs3]#apply filter to each sequence
@@ -367,12 +494,46 @@ def parjobs():
 	#e = Emission([[0,0.5],[0.623,0.980],[-0.622,0.980],[0,0.5],[0,0.5]])
 	e2 = Emission([[0,0.05],[0.5,1],[-0.5,1],[0,0.05],[0,0.05]])
 	print datetime.now()
+	print 'ok'
 	seqs5 = [posterior_step(seq, a2, e2) for seq in seqs4]
+	print 'not ok'
 	print datetime.now()
-	seqs6 = pool.map(f,seqs4)
+	pool.map(functools.partial(f,a=a2,ep=e2.p),seqs4)
+	print datetime.now()
+
+
+"""
+A pickle-able function for generating HMM gaussian sequences in parallel.
+"""
+def parallel_gen_function(x,a,ep):
+	return hmm_generate(1000,a,Emission(ep))[0]
+
+"""
+A function to test the parallel algorithm for the Gaussian emission Baum-Welch training.
+Benchmarks both parallel and non-parallel algorithms
+"""	
+def paralleltest():
+	atest = array([[0.9,0.1],[0.2,0.8]])
+	eptest = array([[5,2],[-5,1]])
+	etest = Emission(eptest)
+	print datetime.now()
+	print "Here are the parameters:"
+	print atest
+	print etest.p
+	cores = cpu_count()
+	pool = Pool(processes=cores)
+	seqs = pool.map(functools.partial(parallel_gen_function,a=atest,ep=eptest),xrange(1000))#training sequences
+	print datetime.now()
+	#seqs2 = [hmm_generate(1000,atest,etest) for i in xrange(1000)]
+	atest = array([[0.85,0.15],[0.3,0.7]])
+	eptest = array([[4.0,1.0],[-2.2,1.0]])
+	etest = Emission(eptest)
+	hmm_train_parallel(seqs, atest, etest, pool)
+	print datetime.now()
+	#hmm_train(seqs,atest,etest)
 	print datetime.now()
 	
-
 if __name__ == '__main__':
 	#Encode_train()
-	parjobs()
+	#parjobs()
+	paralleltest()
