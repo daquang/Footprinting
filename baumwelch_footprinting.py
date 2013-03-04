@@ -7,6 +7,8 @@ import itertools
 import functools
 from multiprocessing import *
 from datetime import datetime
+import warnings
+from exceptions import RuntimeWarning
 
 def hmm_generate(n,a,e):
 	seq = zeros(n)
@@ -145,6 +147,13 @@ Ai - this sequence's contribution to the transition state matrix
 def train_parallel_map(seq, a2, e2p):
 	a_guess = a2
 	e_guess = Emission(e2p)
+	#As of 2/10/13, posterior_decode is used here. This is meant for the
+	#general case of randomly generated HMM sequences.
+	#For training on DNase-Seq data, posterior_step, which assumes
+	#certain start and end states, should be used instead
+	#(s, f_tilde, b_tilde, pdf_matrix) = posterior_decode(seq, a_guess, e_guess)
+	
+	#As of 2/26/13, posterior_step has been implemented again for DNase-Seq
 	(s, f_tilde, b_tilde, pdf_matrix) = posterior_step(seq, a_guess, e_guess)
 	post = s*f_tilde*b_tilde
 	es = pdf_matrix[:,1:].transpose()
@@ -223,27 +232,96 @@ seqs - the training sequences
 a_guess - guess for the transition state matrix
 e_guess - guess for the Emissions parameters
 pool - the multiprocessing pooler
+progress - a file handle for writing results
 """
-def hmm_train_parallel(seqs, a_guess, e_guess, pool):#start here and train_step 1/10/12
-	global a_guess_global
-	global e_guess_global
-	a_guess_global = a_guess
-	e_guess_global = e_guess
-	tol = 1e-6
+def hmm_train_parallel(seqs, a_guess, e_guess, pool, progress):#start here and train_step 1/10/12
+	print "Initial guess"
+	print a_guess
+	print e_guess.p
+	progress.write("Initial guess:\n")
+	progress.write("Transition matrix:\n" + str(a_guess) + "\n") 
+	progress.write("Emission parameters:\n" + str(e_guess.p) + "\n\n") 
+	tol = 1e-9
 	maxiter = 500
 	(new_logP, a_updated, e_updated) = train_step_parallel(seqs, a_guess, e_guess,pool)
 	for k in xrange(maxiter):
-		print "step " + str(k) + "\n"
+		print "step " + str(k+1)
 		print a_updated
 		print e_updated.p
+		print new_logP
+		progress.write("step " + str(k+1) + ":\n")
+		progress.write("Transition matrix:\n" + str(a_updated) + "\n") 
+		progress.write("Emission parameters:\n" + str(e_updated.p) + "\n") 
+		progress.write("Log likelihood:\n" + str(new_logP) + "\n\n")
 		old_logP = new_logP
 		(new_logP, a_updated, e_updated) = train_step_parallel(seqs, a_updated, e_updated,pool)
-		if abs((old_logP - new_logP)/old_logP) < tol:#second conditional break
+		if abs((old_logP - new_logP)/new_logP) < tol:#second conditional break
 			break
-	print 'Converged in ' + str(k) + ' steps'
+	print 'Converged in ' + str(k+1) + ' steps'
 	print a_updated
-	print e_updated
+	print e_updated.p
+	print new_logP
+	progress.write('Converged in ' + str(k+1) + ' steps' + '\n')
+	progress.write("Transition matrix:\n" + str(a_updated) + "\n") 
+	progress.write("Emission parameters:\n" + str(e_updated.p) + "\n") 
+	progress.write("Log likelihood:\n" + str(new_logP) + "\n\n")
 	return a_updated, e_updated
+
+"""
+A parallelized version of the version 2 of hmm_train (that is, with fixing).
+At every iteration step, the transition matrix and the standard deviations of 
+the FP and HS states are reset to the specified defaults.
+Input:
+seqs - the training sequences
+a_guess - guess for the transition state matrix
+e_guess - guess for the Emissions parameters
+pool - the multiprocessing pooler
+progress - a function handle for writing results
+HS_std - the default standard deviation of the HS states
+
+Output:
+a_updated - the converged transition matrix
+e_updated - the converged emissions parameters
+new_logP - the log likelihood of the best guess
+
+These outputs are for saving the best guess since the training will be run several times.
+3/1/13: Removed all print statements, since everything gets printed to the Progress file anyways 
+"""
+def hmm_train_parallel2(seqs, a_guess, e_guess, pool, progress, HS_std):#start here and train_step 1/10/12
+	progress.write("Initial guess:\n")
+	progress.write("Transition matrix:\n" + str(a_guess) + "\n") 
+	progress.write("Emission parameters:\n" + str(e_guess.p) + "\n\n") 
+	tol = 1e-9
+	maxiter = 500
+	a_updated = a_guess
+	(new_logP, a_updated2, e_updated) = train_step_parallel(seqs, a_guess, e_guess,pool)
+	e_updated.p[0][0] = 0
+	e_updated.p[3][0] = 0
+	e_updated.p[4][0] = 0
+	e_updated.p[0][1] = HS_std
+	e_updated.p[3][1] = 1.1*HS_std
+	e_updated.p[4][1] = HS_std
+	for k in xrange(maxiter):
+		progress.write("step " + str(k+1) + ":\n")
+		progress.write("Transition matrix:\n" + str(a_updated) + "\n") 
+		progress.write("Emission parameters:\n" + str(e_updated.p) + "\n") 
+		progress.write("Log likelihood:\n" + str(new_logP) + "\n\n")
+		old_logP = new_logP
+		(new_logP, a_updated2, e_updated) = train_step_parallel(seqs, a_updated, e_updated,pool)
+		e_updated.p[0][0] = 0
+		e_updated.p[3][0] = 0
+		e_updated.p[4][0] = 0
+		e_updated.p[0][1] = HS_std
+		e_updated.p[3][1] = 1.1*HS_std
+		e_updated.p[4][1] = HS_std
+		if abs((old_logP - new_logP)/new_logP) < tol:#second conditional break
+			break
+	progress.write('Converged in ' + str(k+1) + ' steps' + '\n')
+	progress.write("Transition matrix:\n" + str(a_updated) + "\n") 
+	progress.write("Emission parameters:\n" + str(e_updated.p) + "\n") 
+	progress.write("Log likelihood:\n" + str(new_logP) + "\n\n")
+	return a_updated, e_updated, new_logP
+
 
 def train_step(seqs,a_guess,e_guess):#one step of iteration, 
 #returns log likelihood and updated guesses. accepts sequences and guesses. e_guess is an Emission class
@@ -304,6 +382,44 @@ def posterior_step(seq, a, e):#accepts a sequence, the current guesses,
 	#print P	
 	return s, f_tilde, b_tilde, pdf_matrix#return the pdf matrix to save extra computation
 
+"""
+Unlike posterior_step, this function assumes both states have an equal chance
+of beginning and ending.
+"""
+def posterior_decode(seq, a, e):#accepts a sequence, the current guesses, 
+#and returns s, f_tilde, and b_tilde. b_tilde is not transposed
+	L = len(seq)
+	numstates = a.shape[0]
+	aT = a.transpose()
+	pdf_matrix = e.pdf_matrix(seq)#compute all emission probabilities at each index for each state
+	#forward algorithm
+	f_tilde = zeros([numstates,L])
+	s = zeros(L)
+	#initialisation
+	f_tilde[:,0] = 1.0/numstates*pdf_matrix[:,0]#only state 0 can begin the sequence
+	s[0] = f_tilde[:,0].sum()
+	f_tilde[:,0] = f_tilde[:,0]/s[0]
+	#recursion
+	for i in xrange(L-1):
+		y = (f_tilde[:,i] * aT).sum(axis=1)
+		s[i+1] = dot(pdf_matrix[:,i+1],y)
+		f_tilde[:,i+1] = 1/s[i+1]*pdf_matrix[:,i+1]*y
+	#backwards algorithm
+	b_tilde = zeros([numstates,L])
+	#initilisation
+	#b_tilde[-1,-1] = 1/(s[-1]*f_tilde[-1,-1]);#only the last state can end the sequence. denominator ensures 1 sums
+	b_tilde[-1,:] = 1/(s[-1]);#only the last state can end the sequence. denominator ensures 1 sums	
+	for i in xrange(L-2,-1,-1):
+		b_tilde[:,i] = 1/s[i]*(pdf_matrix[:,i+1]*b_tilde[:,i+1]*a).sum(axis=1)	 	
+	#print b
+	#termination
+	#post = s*f*b
+	#print post.sum(axis=0)
+	#P = s[0,1:].prod()
+	#print P	
+	return s, f_tilde, b_tilde, pdf_matrix#return the pdf matrix to save extra computation
+
+
 def train_test():
 	a = array([[0.9, 0.1],[0.2,0.8]])
 	e = array([[0.6, 0.4],[0.3,0.7]])
@@ -319,15 +435,18 @@ def train_test():
 	hmm_train(seqs,a,e)
 
 """
-Returns a normalized and filtered vector appropriate for posterior decoding
+Returns a normalized and filtered vector appropriate for posterior decoding.
+This method implements the first version, which divides the whole vector
+by the mean of all counts greater than 4 and then applies a SG-filter,
+2nd order 5 bp window 1st derivative.
 Input:
 v - the raw signal from a hotspot
 Output:
 v3 - the normalized and filtered first derivative signal
 """
-def normalize_filter(v):
+def normalize_filter_threshold4(v):
 	v2 = v/mean(v[v>4])
-	v3 = savitzky_golay(v2,9,2,1,1)
+	v3 = savitzky_golay(v2,5,2,1,1)
 	return v3
 
 def Encode_train():
@@ -370,6 +489,51 @@ def Encode_train():
 	save('Emission',array(e2.p))
 	progress.write('Ending now...\n')
 	progress.write(str(datetime.now()) + '\n')
+	progress.close()
+	
+"""
+Trains on the top 1000 Hotspots in chromosome 6 using the parallelized functions
+Start here: 3/1/13
+"""
+def Encode_train_parallel():
+	cores = cpu_count()
+	pool = Pool(processes=cores)
+	chr6seqs = load('Chr6seqs.npy')
+	chr6seqs1000 = chr6seqs[0:1000];
+	seqs = pool.map(normalize_filter_threshold4, chr6seqs1000)#training sequences
+	folder = 'Threshold4/'
+	progress = open(folder + 'Progress.txt','w')
+	start = datetime.now()
+	HS_stds = linspace(0.01,0.5,50);
+	best_logP = -inf
+	for HS_std in HS_stds:#the program shouldn't be running longer than a day
+		try:
+			a_test = array([[0.9999,0.0001,0,0,0],[0,0.9,0.1,0,0],[0.0150,0.0450,0.9000,0.035,0.005],[0,0.03,0,0.97,0],[0,0,0,0,1]])
+			e_test = Emission([[0,HS_std],[0.5,1],[-0.5,1],[0,1.1*HS_std],[0,HS_std]])
+			warnings.simplefilter('error')
+			a_updated, e_updated, new_logP = hmm_train_parallel2(seqs, a_test, e_test, pool, progress, HS_std)
+			if new_logP > best_logP:
+				best_logP = new_logP
+				a_best = a_updated
+				e_best = e_updated
+		except RuntimeWarning:
+			progress.write("Training failed... Trying again...\n\n")
+	#Save the best performing parameters
+	save(folder + 'Transition_Best', a_best)
+	save(folder + 'Emission_Best', e_best.p)
+	progress.write('Best parameters:\n')
+	progress.write("Transition matrix:\n" + str(a_best) + "\n") 
+	progress.write("Emission parameters:\n" + str(e_best.p) + "\n")
+	progress.write("Log likelihood:\n" + str(best_logP) + "\n\n") 
+	#Add time performance information
+	stop = datetime.now()
+	delta = stop - start
+	days = str(delta.days)
+	totalsecs = delta.seconds
+	hours = str(totalsecs/3600)
+	minutes = str(mod(totalsecs,3600)/60)
+	seconds = str(mod(totalsecs,60))
+	progress.write('Completed in ' + days + ' days, ' + hours + ' hours, ' + minutes + ' minutes, ' + seconds + ' seconds')
 	progress.close()
 
 def annotated_plot(v,threshold = 4):#plots a the Hotspot along with the annotated regions from the posterior decoding
@@ -434,7 +598,7 @@ def outputFootprintingResults(filename, genome, seqs, regions, a, e, offset=0):
 	psignals = list()
 	frags = list()
 	for seq, region in itertools.izip(seqs,regions):
-		seqnf = normalize_filter(seq)
+		seqnf = normalize_filter_threshold4(seq)
 		(s,f_tilde,b_tilde,pdf_m) = posterior_step(seqnf,a,e)
 		post = s*f_tilde*b_tilde
 		maxstates = post.argmax(axis=0)
@@ -512,9 +676,9 @@ def parallel_gen_function(x,a,ep):
 A function to test the parallel algorithm for the Gaussian emission Baum-Welch training.
 Benchmarks both parallel and non-parallel algorithms
 """	
-def paralleltest():
+def paralleltest(progress):
 	atest = array([[0.9,0.1],[0.2,0.8]])
-	eptest = array([[5,2],[-5,1]])
+	eptest = array([[5,2],[-3,1.4]])
 	etest = Emission(eptest)
 	print datetime.now()
 	print "Here are the parameters:"
@@ -528,12 +692,34 @@ def paralleltest():
 	atest = array([[0.85,0.15],[0.3,0.7]])
 	eptest = array([[4.0,1.0],[-2.2,1.0]])
 	etest = Emission(eptest)
-	hmm_train_parallel(seqs, atest, etest, pool)
+	hmm_train_parallel(seqs, atest, etest, pool, progress)
 	print datetime.now()
 	#hmm_train(seqs,atest,etest)
-	print datetime.now()
+	#print datetime.now()
 	
 if __name__ == '__main__':
 	#Encode_train()
 	#parjobs()
-	paralleltest()
+	"""
+	progress = open('Progress.txt','w')
+	start = datetime.now()
+	while (datetime.now() - start).days < 1:#the program shouldn't be running longer than a day
+		try:
+			warnings.simplefilter('error')
+			paralleltest(progress)
+			break
+		except RuntimeWarning:
+			progress.write("Training failed... Trying again...\n\n")
+			break
+	stop = datetime.now()
+	delta = stop - start
+	days = str(delta.days)
+	totalsecs = delta.seconds
+	hours = str(totalsecs/3600)
+	minutes = str(mod(totalsecs,3600)/60)
+	seconds = str(mod(totalsecs,60))
+	progress.write('Completed in ' + days + ' days, ' + hours + ' hours, ' + minutes + ' minutes, ' + seconds + ' seconds')
+	progress.close()
+	"""
+	Encode_train_parallel()	
+		
