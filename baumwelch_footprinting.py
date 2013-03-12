@@ -1,11 +1,12 @@
 #!/usr/bin/env python
 from DNase_functions import *
+from normfilts import *
 from numpy import *
 from Emissions import *
 from random import *
 import itertools
 import functools
-from multiprocessing import *
+from multiprocessing import Pool, cpu_count
 from datetime import datetime
 import warnings
 from exceptions import RuntimeWarning
@@ -26,15 +27,15 @@ def hmm_generate(n,a,e):
 	return seq, states
 
 def weighted_choice(weights):#returns weighted random sample
-    totals = []
-    running_total = 0
-    for w in weights:
-        running_total += w
-        totals.append(running_total)
-    rnd = random() * running_total
-    for i, total in enumerate(totals):
-        if rnd < total:
-            return i
+	totals = []
+	running_total = 0
+	for w in weights:
+		running_total += w
+		totals.append(running_total)
+	rnd = random() * running_total
+	for i, total in enumerate(totals):
+		if rnd < total:
+			return i
 
 def hmm_estimate(seq, states):#returns maximum likelihood a and e for known states
 	statesset = sort(list(set(states)))
@@ -434,21 +435,6 @@ def train_test():
 	seqs.append(seq)
 	hmm_train(seqs,a,e)
 
-"""
-Returns a normalized and filtered vector appropriate for posterior decoding.
-This method implements the first version, which divides the whole vector
-by the mean of all counts greater than 4 and then applies a SG-filter,
-2nd order 5 bp window 1st derivative.
-Input:
-v - the raw signal from a hotspot
-Output:
-v3 - the normalized and filtered first derivative signal
-"""
-def normalize_filter_threshold4(v):
-	v2 = v/mean(v[v>4])
-	v3 = savitzky_golay(v2,5,2,1,1)
-	return v3
-
 def Encode_train():
 	from datetime import datetime
 	from smooth import smooth
@@ -500,31 +486,31 @@ def Encode_train_parallel():
 	pool = Pool(processes=cores)
 	chr6seqs = load('Chr6seqs.npy')
 	chr6seqs1000 = chr6seqs[0:1000];
-	seqs = pool.map(normalize_filter_threshold4, chr6seqs1000)#training sequences
-	folder = 'Threshold4/'
+	r = load('K562_MTPN_promoter.npy')
+	normfiltfunc = functools.partial(normalize_quantilemap,r=r)
+	seqs = pool.map(normfiltfunc, chr6seqs1000)#training sequences
+	folder = 'QuantileMapToMTPN/'
 	progress = open(folder + 'Progress.txt','w')
 	start = datetime.now()
 	HS_stds = linspace(0.01,0.5,50);
-	best_logP = -inf
+	all_transition = list()
+	all_emission = list()
+	all_logP = list()
 	for HS_std in HS_stds:#the program shouldn't be running longer than a day
 		try:
 			a_test = array([[0.9999,0.0001,0,0,0],[0,0.9,0.1,0,0],[0.0150,0.0450,0.9000,0.035,0.005],[0,0.03,0,0.97,0],[0,0,0,0,1]])
 			e_test = Emission([[0,HS_std],[0.5,1],[-0.5,1],[0,1.1*HS_std],[0,HS_std]])
 			warnings.simplefilter('error')
 			a_updated, e_updated, new_logP = hmm_train_parallel2(seqs, a_test, e_test, pool, progress, HS_std)
-			if new_logP > best_logP:
-				best_logP = new_logP
-				a_best = a_updated
-				e_best = e_updated
+			all_transition.append(a_updated)
+			all_emission.append(e_updated.p)
+			all_logP.append(new_logP)
 		except RuntimeWarning:
 			progress.write("Training failed... Trying again...\n\n")
 	#Save the best performing parameters
-	save(folder + 'Transition_Best', a_best)
-	save(folder + 'Emission_Best', e_best.p)
-	progress.write('Best parameters:\n')
-	progress.write("Transition matrix:\n" + str(a_best) + "\n") 
-	progress.write("Emission parameters:\n" + str(e_best.p) + "\n")
-	progress.write("Log likelihood:\n" + str(best_logP) + "\n\n") 
+	save(folder + 'Transitions', array(all_transition))
+	save(folder + 'Emissions', array(all_emission))
+	save(folder + 'logPs', array(all_logP))
 	#Add time performance information
 	stop = datetime.now()
 	delta = stop - start
@@ -572,35 +558,52 @@ def annotated_plot(v,threshold = 4):#plots a the Hotspot along with the annotate
 	pylab.ylabel('DNase I Cuts')
 
 """
+The mapping function used in outputFootingResults. Only the posterior probabilities
+are needed
+Input:
+seq - a training sequence
+a2 - guess for the transition state matrix
+e2p - guess for the Emissions parameters. A numpy array (because it is picklable)
+normfiltfunc - function for normalization and filtering
+Output:
+post - the posterior decoded probabilities matrix
+"""
+def output_parallel_map(seq, a2, e2p, normfiltfunc):
+	a_guess = a2
+	e_guess = Emission(e2p)
+	seq2 = normfiltfunc(seq)
+	(s, f_tilde, b_tilde, pdf_matrix) = posterior_step(seq2, a_guess, e_guess)
+	post = s*f_tilde*b_tilde
+	return post
+
+"""
 Function that writes all annotated Footprint sequences to a FASTA file
 Intput:
 filename - a string. all generated files start with this name
-genome - a string. assumes the worldbank's file has been downloaded
+genome - a string. Filename of the genome fasta file
 seqs - an iterable collection of numpy arrays representing Hotspot signal
 regions - a PybedTools bedfile. holds the location of each Hotspot. corresponding order to seqs
 a - a numpy array. The transition matrix between each state
 e - an Emission object. The emission parameters for the states
 offset - an integer. tells how much each footprint should be extended in both directions
-
+pool - a multiprocessing pool object. For parallel processing
 Output:
 Writes all footprint sequences to a fasta file (filename.fasta), a wig file (filename.wig), footprint raw signal to .npy (filename_signal.npy), and sequence p-values to .npy (filename_p.npy). Each record in the fasta file is UCSC coordinates.
-The wig file contains the sequence and the score (highest p-value)
+The wig file contains the sequence and the score (highest p-value). The wig file is generated first and it is then converted to a Fasta file using pybedtools.
 """
-def outputFootprintingResults(filename, genome, seqs, regions, a, e, offset=0):
+def outputFootprintingResults(filename, genome, seqs, regions, a, e, offset=0,pool):
+	"""
 	from pygr import seqdb
-	import itertools
 	from Bio import SeqIO
 	from Bio.SeqRecord import SeqRecord
 	from Bio.Seq import Seq
 	g = seqdb.SequenceFileDB(genome)
+	"""
 	wigfile = open(filename + '.wig', 'w')
 	rawsignals = list()
 	psignals = list()
-	frags = list()
-	for seq, region in itertools.izip(seqs,regions):
-		seqnf = normalize_filter_threshold4(seq)
-		(s,f_tilde,b_tilde,pdf_m) = posterior_step(seqnf,a,e)
-		post = s*f_tilde*b_tilde
+	posts = pool.map(functools.partial(output_parallel_map,a2=a,e2p=e.p,normfiltfunc=normalize_filter_threshold4),seqs)
+	for seq, post, region in itertools.izip(seqs, posts,regions):
 		maxstates = post.argmax(axis=0)
 		foots = (maxstates == 3)*1
 		bins = diff(foots)
@@ -611,20 +614,16 @@ def outputFootprintingResults(filename, genome, seqs, regions, a, e, offset=0):
 		for start, stop in zip(starts, stops):
 			ftstart = chrstart + start#absolute chr start position of footprint in 0-base
 			ftstop = chrstart + stop#absolute chr stop position of footprint in 0-base
-			ftseq = str(g[chromosome][ftstart:ftstop])
 			ftsignal = seq[start:stop]
 			ftp = post[3][start:stop]
 			rawsignals.append(ftsignal)
 			psignals.append(ftp)
-			record=SeqRecord(Seq(ftseq),chromosome+":"+str(ftstart+1)+"-"+str(ftstop),'','')#+1 for UCSC convention
-			frags.append(record)
 			wigfile.write(chromosome + '\t' + str(ftstart) + '\t' + str(ftstop) + '\t' + str(max(ftp)) + '\n')
 	save(filename+"_signal",array(rawsignals))
 	save(filename+"_p",array(psignals))	
 	wigfile.close()
-	output_handle = open(filename + ".fasta", "w")
-	SeqIO.write(frags, output_handle, "fasta")
-	output_handle.close()
+	bedfile = pybedtools.BedTool(filename + '.wig')
+	bedfile.sequence(fi=genome,fo=filename + '.fa')#output the Fasta file
 	
 
 def f(x,a,ep):
