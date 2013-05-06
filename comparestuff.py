@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 from numpy import *
 from pylab import *
-from DNase_functions3 import *
+from DNase_functions import *
 from scipy.stats.mstats import *
 
 """

@@ -317,6 +317,9 @@ def hmm_train_parallel2(seqs, a_guess, e_guess, pool, progress, HS_std):#start h
 		e_updated.p[4][1] = HS_std
 		if abs((old_logP - new_logP)/new_logP) < tol:#second conditional break
 			break
+		if isnan(new_logP):
+			progress.write("Training failed... \n\n")
+			break
 	progress.write('Converged in ' + str(k+1) + ' steps' + '\n')
 	progress.write("Transition matrix:\n" + str(a_updated) + "\n") 
 	progress.write("Emission parameters:\n" + str(e_updated.p) + "\n") 
@@ -487,19 +490,19 @@ def Encode_train_parallel():
 	chr6seqs = load('Chr6seqs.npy')
 	chr6seqs1000 = chr6seqs[0:1000];
 	r = load('K562_MTPN_promoter.npy')
-	normfiltfunc = functools.partial(normalize_quantilemap,r=r)
+	normfiltfunc = functools.partial(normalize_filter_quantilemap,r=r)
 	seqs = pool.map(normfiltfunc, chr6seqs1000)#training sequences
 	folder = 'QuantileMapToMTPN/'
 	progress = open(folder + 'Progress.txt','w')
 	start = datetime.now()
-	HS_stds = linspace(0.01,0.5,50);
+	HS_stds = linspace(0.01,2.46,51);
 	all_transition = list()
 	all_emission = list()
 	all_logP = list()
 	for HS_std in HS_stds:#the program shouldn't be running longer than a day
 		try:
 			a_test = array([[0.9999,0.0001,0,0,0],[0,0.9,0.1,0,0],[0.0150,0.0450,0.9000,0.035,0.005],[0,0.03,0,0.97,0],[0,0,0,0,1]])
-			e_test = Emission([[0,HS_std],[0.5,1],[-0.5,1],[0,1.1*HS_std],[0,HS_std]])
+			e_test = Emission([[0,HS_std],[10,5],[-10,5],[0,1.1*HS_std],[0,HS_std]])
 			warnings.simplefilter('error')
 			a_updated, e_updated, new_logP = hmm_train_parallel2(seqs, a_test, e_test, pool, progress, HS_std)
 			all_transition.append(a_updated)
@@ -522,13 +525,10 @@ def Encode_train_parallel():
 	progress.write('Completed in ' + days + ' days, ' + hours + ' hours, ' + minutes + ' minutes, ' + seconds + ' seconds')
 	progress.close()
 
-def annotated_plot(v,threshold = 4):#plots a the Hotspot along with the annotated regions from the posterior decoding
+def annotated_plot(v,normfiltfunc,a,e):#plots a the Hotspot along with the annotated regions from the posterior decoding
 	import pylab
-	v2 = v/mean(v[v>threshold])
-	v3 = savitzky_golay(v2, 9, 2, deriv=1, rate=1)
-	a = load('Transition.npy')
-	e = Emission(load('Emission.npy'))
-	(s,f,b,pdf_m) = posterior_step(v3,a,e)
+	v2 = normfiltfunc(v)
+	(s,f,b,pdf_m) = posterior_step(v2,a,e)
 	post = s*f*b
 	maxstates = post.argmax(axis=0)
 	#label the footprints
@@ -591,7 +591,7 @@ Output:
 Writes all footprint sequences to a fasta file (filename.fasta), a wig file (filename.wig), footprint raw signal to .npy (filename_signal.npy), and sequence p-values to .npy (filename_p.npy). Each record in the fasta file is UCSC coordinates.
 The wig file contains the sequence and the score (highest p-value). The wig file is generated first and it is then converted to a Fasta file using pybedtools.
 """
-def outputFootprintingResults(filename, genome, seqs, regions, a, e, offset=0,pool):
+def outputFootprintingResults(filename, genome, seqs, regions, a, e, pool, offset=0):
 	"""
 	from pygr import seqdb
 	from Bio import SeqIO

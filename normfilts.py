@@ -13,10 +13,11 @@ r - a reference distribution that v will be mapped onto
 Output:
 t - a transformation of v that preserves the rank of its values but mapped to r
 """
-def normalize_quantilemap(v,r):
+def normalize_filter_quantilemap(v,r):
     ranks = rankdata(v)/len(v)
-    t = mquantiles(r,prob=ranks)
-    return t
+    v2 = mquantiles(r,prob=ranks)
+    v3 = savitzky_golay(v2,5,2,1,1)
+    return v3
 
 
 """
